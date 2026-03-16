@@ -1,29 +1,117 @@
 import { NextResponse } from "next/server";
+import { generateRtcToken } from "@/lib/agora/tokenBuilder";
 
-type VoiceAgentAction = "start-session" | "stop-session";
+const APP_ID = process.env.NEXT_PUBLIC_AGORA_APP_ID ?? "";
+const CUSTOMER_ID = process.env.AGORA_CUSTOMER_ID ?? "";
+const CUSTOMER_SECRET = process.env.AGORA_CUSTOMER_SECRET ?? "";
+
+// Agora Conversational AI Engine base URL (US region)
+const CONVO_AI_BASE_URL = "https://api.agora.io/api/conversational-ai-agent/v2/projects";
+
+function getBasicAuth(): string {
+  return Buffer.from(`${CUSTOMER_ID}:${CUSTOMER_SECRET}`).toString("base64");
+}
 
 type VoiceAgentPayload = {
-  action?: VoiceAgentAction;
+  action?: "start-session" | "stop-session";
+  channel?: string;
   sessionId?: string;
 };
 
 export async function POST(request: Request) {
   const payload = (await request.json()) as VoiceAgentPayload;
-  const sessionId = crypto.randomUUID();
+
+  if (payload.action === "stop-session" && payload.sessionId) {
+    return handleStopSession(payload.sessionId);
+  }
+
+  return handleStartSession(payload.channel);
+}
+
+async function handleStartSession(channel?: string) {
+  const channelName = channel ?? `emergency-${Date.now()}`;
+  const agentUid = 0; // Let Agora assign
+  const userUid = Math.floor(Math.random() * 100000) + 1000;
+
+  // Generate token for the user to join the channel
+  const userToken = generateRtcToken(channelName, userUid);
+
+  // Start the Conversational AI agent via Agora REST API
+  const response = await fetch(`${CONVO_AI_BASE_URL}/${APP_ID}/agents`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${getBasicAuth()}`,
+    },
+    body: JSON.stringify({
+      name: `first-aid-bot-${Date.now()}`,
+      properties: {
+        channel: {
+          channel_name: channelName,
+          token: generateRtcToken(channelName, agentUid),
+          agent_rtc_uid: String(agentUid),
+        },
+        llm: {
+          url: "https://api.openai.com/v1",
+          api_key: process.env.OPENAI_API_KEY ?? "",
+          model: "gpt-4o-mini",
+          system_messages: [
+            {
+              role: "system",
+              content:
+                "You are First Aid Bot, an emergency medical voice assistant. You provide calm, clear first aid instructions to help responders assist patients in distress. Focus on the patient's condition and guide the responder step by step. Be concise and reassuring. If the situation is life-threatening, always remind them to call 911 or 143 (Philippine Red Cross).",
+            },
+          ],
+        },
+        tts: {
+          vendor: "microsoft",
+          params: {
+            key: process.env.AZURE_TTS_KEY ?? "",
+            region: process.env.AZURE_TTS_REGION ?? "eastus",
+            voice_name: "en-US-JennyNeural",
+          },
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Agora Convo AI error:", response.status, errorBody);
+    return NextResponse.json(
+      { ok: false, error: "Failed to start conversational AI agent", details: errorBody },
+      { status: response.status }
+    );
+  }
+
+  const data = await response.json();
 
   return NextResponse.json({
     ok: true,
-    sessionId,
-    requestedAction: payload.action,
-    awsBedrock: {
-      provider: "aws-bedrock",
-      status: "placeholder",
-      modelId: process.env.AWS_BEDROCK_MODEL_ID ?? null,
-    },
-    elevenLabs: {
-      provider: "elevenlabs",
-      status: "placeholder",
-      voiceId: process.env.ELEVENLABS_VOICE_ID ?? null,
+    sessionId: data.agent_id ?? data.id,
+    channelName,
+    userUid,
+    userToken,
+    appId: APP_ID,
+  });
+}
+
+async function handleStopSession(sessionId: string) {
+  const response = await fetch(`${CONVO_AI_BASE_URL}/${APP_ID}/agents/${sessionId}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Basic ${getBasicAuth()}`,
     },
   });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Agora Convo AI stop error:", response.status, errorBody);
+    return NextResponse.json(
+      { ok: false, error: "Failed to stop agent", details: errorBody },
+      { status: response.status }
+    );
+  }
+
+  return NextResponse.json({ ok: true, sessionId });
 }
